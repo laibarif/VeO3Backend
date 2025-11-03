@@ -416,9 +416,3 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-    # Only needed for Vercel deployment
-from mangum import Mangum 
-handler = Mangum(app)
-print("✅ App loaded successfully for Vercel")
-
