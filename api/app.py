@@ -382,7 +382,7 @@ async def generate_video_background(video_id: str, prompt: str, aspect_ratio: st
         # Convert local path to a public URL for frontend
         preview_filename = os.path.basename(video_path)
         
-        preview_url = f"http://backend-six-jet-19.vercel.app/generated_videos/{preview_filename}"
+        preview_url = f"http://veo3backend-production.up.railway.app/generated_videos/{preview_filename}"
         # preview_url = f"http://localhost:8000/generated_videos/{preview_filename}"
 
         video_service.update_video_after_generation(video_id, preview_url=preview_url, duration=duration)
