@@ -26,6 +26,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# List of emails that don't need payment checks - same as frontend
+FREE_ACCESS_EMAILS = [
+    "trajectri@gmail.com",
+    "awaisnaeem962@gmail.com", 
+    "laibaslatch@gmail.com"
+]
+
 class VideoCreateRequest(BaseModel):
     user_id: str
     prompt: str
@@ -59,6 +66,31 @@ class VideoGenerationService:
         self.db_conn = psycopg2.connect(database_url, sslmode='require')
         print("Neon database connection established")
 
+    def get_user_email(self, clerk_id: str) -> Optional[str]:
+        """Get user email from Clerk ID"""
+        try:
+            # In a real implementation, you would fetch this from Clerk API
+            # For now, we'll simulate by checking if we have stored the email
+            with self.db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("SELECT email FROM users WHERE clerk_id = %s", (clerk_id,))
+                user = cursor.fetchone()
+                return user['email'] if user and user.get('email') else None
+        except Exception as e:
+            print(f"Error getting user email: {e}")
+            return None
+
+    def has_free_access(self, clerk_id: str) -> bool:
+        """Check if user has free access based on email"""
+        try:
+            user_email = self.get_user_email(clerk_id)
+            if user_email and user_email in FREE_ACCESS_EMAILS:
+                print(f"User {clerk_id} has free access with email: {user_email}")
+                return True
+            return False
+        except Exception as e:
+            print(f"Error checking free access: {e}")
+            return False
+
     def get_or_create_internal_user(self, clerk_id: str):
         """Return the internal UUID corresponding to a Clerk ID."""
         with self.db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -80,8 +112,13 @@ class VideoGenerationService:
             return new_user_id
 
     def check_user_credits(self, clerk_user_id: str) -> bool:
-        """Check if user has video credits available"""
+        """Check if user has video credits available - skip for free access emails"""
         try:
+            # Check free access first
+            if self.has_free_access(clerk_user_id):
+                print(f"User {clerk_user_id} has free access, skipping credit check")
+                return True
+
             with self.db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 # Get internal user ID
                 internal_user_id = self.get_or_create_internal_user(clerk_user_id)
@@ -112,8 +149,13 @@ class VideoGenerationService:
             return False
 
     def use_video_credit(self, clerk_user_id: str, video_id: str) -> bool:
-        """Use one video credit for the user"""
+        """Use one video credit for the user - skip for free access emails"""
         try:
+            # Skip credit usage for free access users
+            if self.has_free_access(clerk_user_id):
+                print(f"User {clerk_user_id} has free access, skipping credit usage")
+                return True
+
             with self.db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 internal_user_id = self.get_or_create_internal_user(clerk_user_id)
                 
@@ -320,7 +362,7 @@ video_service = VideoGenerationService()
 async def create_video(request: VideoCreateRequest, background_tasks: BackgroundTasks):
     """Endpoint to replace your TRPC create procedure"""
     try:
-        # Check if user has credits
+        # Check if user has credits (skip for free access emails)
         if not video_service.check_user_credits(request.user_id):
             raise HTTPException(
                 status_code=402, 
@@ -331,7 +373,7 @@ async def create_video(request: VideoCreateRequest, background_tasks: Background
         video_record = video_service.create_video_record(request.user_id, request.title)
         video_id = video_record['id']
         
-        # Use one credit
+        # Use one credit (skip for free access emails)
         if not video_service.use_video_credit(request.user_id, video_id):
             raise HTTPException(
                 status_code=402, 
