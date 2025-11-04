@@ -66,26 +66,56 @@ class VideoGenerationService:
         self.db_conn = psycopg2.connect(database_url, sslmode='require')
         print("Neon database connection established")
 
-    def get_user_email(self, clerk_id: str) -> Optional[str]:
-        """Get user email from Clerk ID"""
+    def get_user_email_from_clerk(self, clerk_id: str) -> Optional[str]:
+        """Get user email from Clerk API"""
         try:
-            # In a real implementation, you would fetch this from Clerk API
-            # For now, we'll simulate by checking if we have stored the email
-            with self.db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute("SELECT email FROM users WHERE clerk_id = %s", (clerk_id,))
-                user = cursor.fetchone()
-                return user['email'] if user and user.get('email') else None
+            import requests
+            
+            clerk_secret_key = os.getenv("CLERK_SECRET_KEY")
+            if not clerk_secret_key:
+                print("CLERK_SECRET_KEY not found in environment")
+                return None
+            
+            # Call Clerk API to get user details
+            headers = {
+                "Authorization": f"Bearer {clerk_secret_key}",
+                "Content-Type": "application/json"
+            }
+            
+            response = requests.get(
+                f"https://api.clerk.com/v1/users/{clerk_id}",
+                headers=headers
+            )
+            
+            if response.status_code == 200:
+                user_data = response.json()
+                # Get primary email address
+                email_addresses = user_data.get('email_addresses', [])
+                primary_email = next(
+                    (email for email in email_addresses if email.get('id') == user_data.get('primary_email_address_id')),
+                    email_addresses[0] if email_addresses else None
+                )
+                
+                if primary_email:
+                    email = primary_email.get('email_address')
+                    print(f"Found email for user {clerk_id}: {email}")
+                    return email
+            
+            print(f"Failed to get email for user {clerk_id}: {response.status_code}")
+            return None
+            
         except Exception as e:
-            print(f"Error getting user email: {e}")
+            print(f"Error getting user email from Clerk: {e}")
             return None
 
     def has_free_access(self, clerk_id: str) -> bool:
         """Check if user has free access based on email"""
         try:
-            user_email = self.get_user_email(clerk_id)
+            user_email = self.get_user_email_from_clerk(clerk_id)
             if user_email and user_email in FREE_ACCESS_EMAILS:
                 print(f"User {clerk_id} has free access with email: {user_email}")
                 return True
+            print(f"User {clerk_id} does not have free access. Email: {user_email}")
             return False
         except Exception as e:
             print(f"Error checking free access: {e}")
