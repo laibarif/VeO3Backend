@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from fastapi.staticfiles import StaticFiles
+import contextlib
 
 app = FastAPI()
 
@@ -30,7 +31,7 @@ app.add_middleware(
 FREE_ACCESS_EMAILS = [
     "trajectri@gmail.com",
     "awaisnaeem962@gmail.com", 
-    "laibaslatch@gmail.com"
+    "laibaslatch@gmail.com",
 ]
 
 class VideoCreateRequest(BaseModel):
@@ -41,16 +42,60 @@ class VideoCreateRequest(BaseModel):
     resolution: Optional[str] = "720p"
     negative_prompt: Optional[str] = None
 
+class DatabaseManager:
+    """Manages database connections with proper error handling and reconnection"""
+    
+    def __init__(self):
+        self._connection = None
+        self.database_url = os.getenv("DATABASE_URL")
+        
+    def get_connection(self):
+        """Get a fresh database connection"""
+        try:
+            if self._connection is not None:
+                self._connection.close()
+        except:
+            pass
+            
+        try:
+            self._connection = psycopg2.connect(self.database_url, sslmode='require')
+            print("✅ New database connection established")
+            return self._connection
+        except Exception as e:
+            print(f"❌ Failed to establish database connection: {e}")
+            raise
+    
+    @contextlib.contextmanager
+    def get_cursor(self):
+        """Context manager for database operations with automatic connection handling"""
+        conn = None
+        cursor = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            yield cursor
+            conn.commit()
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            print(f"❌ Database operation failed: {e}")
+            raise
+        finally:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()
+
 class VideoGenerationService:
     def __init__(self):
         self.client = None
-        self.db_conn = None
+        self.db_manager = DatabaseManager()
         self.init_services()
     
     def init_services(self):
         load_dotenv()
         
-        # Google AI client - using the new genai client (same as your working script)
+        # Google AI client - using the new genai client
         api_key = os.getenv("VEO3_API_KEY")
         if not api_key:
             raise ValueError("VEO3_API_KEY not found")
@@ -58,26 +103,14 @@ class VideoGenerationService:
         self.client = genai.Client(api_key=api_key)
         print("Google AI Veo client initialized successfully")
         
-        # Database connection using your Neon DB URL
-        database_url = os.getenv("DATABASE_URL")
-        if not database_url:
-            raise ValueError("DATABASE_URL not found")
-        
-        self.db_conn = psycopg2.connect(database_url, sslmode='require')
-        print("Neon database connection established")
-    
-    def get_connection(self):
-        """Ensure a valid PostgreSQL connection before each DB query."""
+        # Test database connection
         try:
-            if self.db_conn is None or self.db_conn.closed != 0:
-                database_url = os.getenv("DATABASE_URL")
-                self.db_conn = psycopg2.connect(database_url, sslmode='require')
-                print("🔄 Reconnected to Neon database")
+            with self.db_manager.get_cursor() as cursor:
+                cursor.execute("SELECT 1")
+            print("Neon database connection established successfully")
         except Exception as e:
-            print(f"⚠️ Error reconnecting to database: {e}")
+            print(f"Failed to establish database connection: {e}")
             raise
-        return self.db_conn
-
 
     def get_user_email_from_clerk(self, clerk_id: str) -> Optional[str]:
         """Get user email from Clerk API"""
@@ -136,8 +169,7 @@ class VideoGenerationService:
 
     def get_or_create_internal_user(self, clerk_id: str):
         """Return the internal UUID corresponding to a Clerk ID."""
-        conn = self.get_connection()
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+        with self.db_manager.get_cursor() as cursor:
             # Check if user already exists
             cursor.execute("SELECT id FROM users WHERE clerk_id = %s", (clerk_id,))
             user = cursor.fetchone()
@@ -152,8 +184,8 @@ class VideoGenerationService:
                 VALUES (%s, %s, %s, %s, %s)
                 RETURNING id
             """, (new_user_id, clerk_id, "Unknown Name", "", 3))  # 3 free credits
-            self.db_conn.commit()
-            return new_user_id
+            result = cursor.fetchone()
+            return result['id']
 
     def check_user_credits(self, clerk_user_id: str) -> bool:
         """Check if user has video credits available - skip for free access emails"""
@@ -163,8 +195,7 @@ class VideoGenerationService:
                 print(f"User {clerk_user_id} has free access, skipping credit check")
                 return True
 
-            conn = self.get_connection()
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            with self.db_manager.get_cursor() as cursor:
                 # Get internal user ID
                 internal_user_id = self.get_or_create_internal_user(clerk_user_id)
                 
@@ -201,8 +232,7 @@ class VideoGenerationService:
                 print(f"User {clerk_user_id} has free access, skipping credit usage")
                 return True
 
-            conn = self.get_connection()
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            with self.db_manager.get_cursor() as cursor:
                 internal_user_id = self.get_or_create_internal_user(clerk_user_id)
                 
                 # Try to use subscription credit first
@@ -222,7 +252,6 @@ class VideoGenerationService:
                         INSERT INTO video_credits_usage (user_id, video_id, credits_used)
                         VALUES (%s, %s, 1)
                     """, (internal_user_id, video_id))
-                    self.db_conn.commit()
                     return True
                 
                 # Try to use free credit
@@ -241,115 +270,93 @@ class VideoGenerationService:
                         INSERT INTO video_credits_usage (user_id, video_id, credits_used)
                         VALUES (%s, %s, 1)
                     """, (internal_user_id, video_id))
-                    self.db_conn.commit()
                     return True
                 
                 return False
                 
         except Exception as e:
-            self.db_conn.rollback()
             print(f"Error using video credit: {e}")
             return False
 
     def create_video_record(self, clerk_user_id: str, title: str = "Untitled"):
-        try:
-            conn = self.get_connection()
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                video_id = str(uuid.uuid4())
-                now = datetime.now()
+        """Create a new video record in the database"""
+        with self.db_manager.get_cursor() as cursor:
+            video_id = str(uuid.uuid4())
+            now = datetime.now()
 
-                # Get internal UUID for the Clerk user
-                internal_user_id = self.get_or_create_internal_user(clerk_user_id)
+            # Get internal UUID for the Clerk user
+            internal_user_id = self.get_or_create_internal_user(clerk_user_id)
 
-                cursor.execute("""
-                    INSERT INTO videos (
-                        id, user_id, title, description, visibility, 
-                        mux_status, duration, created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING *
-                """, (
-                    video_id,
-                    internal_user_id,
-                    title,
-                    f"AI Generated Video for {clerk_user_id}",
-                    'private',
-                    'generating',
-                    0,
-                    now,
-                    now
-                ))
+            cursor.execute("""
+                INSERT INTO videos (
+                    id, user_id, title, description, visibility, 
+                    mux_status, duration, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """, (
+                video_id,
+                internal_user_id,
+                title,
+                f"AI Generated Video for {clerk_user_id}",
+                'private',
+                'generating',
+                0,
+                now,
+                now
+            ))
 
-                video_record = cursor.fetchone()
-                self.db_conn.commit()
-                print(f"Stored video for Clerk user: {clerk_user_id}")
-                return video_record
-
-        except Exception as e:
-            self.db_conn.rollback()
-            raise e
+            video_record = cursor.fetchone()
+            print(f"Stored video for Clerk user: {clerk_user_id}")
+            return video_record
     
     def update_video_after_generation(self, video_id: str, preview_url: str, duration: int = None):
-        try:
-            conn = self.get_connection()
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute("""
-                    UPDATE videos 
-                    SET mux_status = %s, 
-                        duration = %s,
-                        updated_at = %s,
-                        visibility = %s,
-                        preview_url = %s
-                    WHERE id = %s
-                    RETURNING *
-                """, ('ready', duration, datetime.now(), 'public', preview_url, video_id))
-            
-                updated_video = cursor.fetchone()
-                self.db_conn.commit()
-                return updated_video
-            
-        except Exception as e:
-            self.db_conn.rollback()
-            raise e
+        """Update video record after successful generation"""
+        with self.db_manager.get_cursor() as cursor:
+            cursor.execute("""
+                UPDATE videos 
+                SET mux_status = %s, 
+                    duration = %s,
+                    updated_at = %s,
+                    visibility = %s,
+                    preview_url = %s
+                WHERE id = %s
+                RETURNING *
+            """, ('ready', duration, datetime.now(), 'public', preview_url, video_id))
+        
+            updated_video = cursor.fetchone()
+            return updated_video
 
     def update_video_status(self, video_id: str, status: str, error_message: str = None):
         """Update video status in database"""
-        try:
-            conn = self.get_connection()
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                # First check if error_message column exists
-                if error_message:
-                    try:
-                        cursor.execute("""
-                            UPDATE videos 
-                            SET mux_status = %s, 
-                                updated_at = %s,
-                                error_message = %s
-                            WHERE id = %s
-                        """, (status, datetime.now(), error_message, video_id))
-                    except psycopg2.Error:
-                        # If error_message column doesn't exist, update without it
-                        cursor.execute("""
-                            UPDATE videos 
-                            SET mux_status = %s, 
-                                updated_at = %s
-                            WHERE id = %s
-                        """, (status, datetime.now(), video_id))
-                else:
+        with self.db_manager.get_cursor() as cursor:
+            # First check if error_message column exists
+            if error_message:
+                try:
+                    cursor.execute("""
+                        UPDATE videos 
+                        SET mux_status = %s, 
+                            updated_at = %s,
+                            error_message = %s
+                        WHERE id = %s
+                    """, (status, datetime.now(), error_message, video_id))
+                except psycopg2.Error:
+                    # If error_message column doesn't exist, update without it
                     cursor.execute("""
                         UPDATE videos 
                         SET mux_status = %s, 
                             updated_at = %s
                         WHERE id = %s
                     """, (status, datetime.now(), video_id))
-                
-                self.db_conn.commit()
-                
-        except Exception as e:
-            self.db_conn.rollback()
-            raise e
+            else:
+                cursor.execute("""
+                    UPDATE videos 
+                    SET mux_status = %s, 
+                        updated_at = %s
+                    WHERE id = %s
+                """, (status, datetime.now(), video_id))
 
     def generate_video(self, prompt: str, aspect_ratio: str = "16:9", resolution: str = "720p", negative_prompt: str = None):
-        """Generate video using Google Veo AI - same as your working script"""
+        """Generate video using Google Veo AI"""
         try:
             config = types.GenerateVideosConfig(
                 negative_prompt=negative_prompt if negative_prompt else None,
@@ -368,7 +375,7 @@ class VideoGenerationService:
             raise RuntimeError(f"Failed to start video generation: {e}")
 
     def poll_operation(self, operation, poll_interval: int = 5):
-        """Poll the generation operation until completion - same as your working script"""
+        """Poll the generation operation until completion"""
         start_time = time.time()
         print("Generating video...")
 
@@ -385,7 +392,7 @@ class VideoGenerationService:
         return operation
 
     def save_video_to_storage(self, operation, output_dir: str = "generated_videos"):
-        """Save the generated video and return the file path - same as your working script"""
+        """Save the generated video and return the file path"""
         try:
             if not operation.response or not operation.response.generated_videos:
                 raise ValueError("No video generated in the response.")
@@ -489,7 +496,7 @@ async def generate_video_background(video_id: str, prompt: str, aspect_ratio: st
 async def get_video_status(video_id: str):
     """Check video generation status"""
     try:
-        with video_service.db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
+        with video_service.db_manager.get_cursor() as cursor:
             cursor.execute("SELECT * FROM videos WHERE id = %s", (video_id,))
             video = cursor.fetchone()
             
