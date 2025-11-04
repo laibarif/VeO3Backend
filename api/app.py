@@ -65,6 +65,19 @@ class VideoGenerationService:
         
         self.db_conn = psycopg2.connect(database_url, sslmode='require')
         print("Neon database connection established")
+    
+    def get_connection(self):
+        """Ensure a valid PostgreSQL connection before each DB query."""
+        try:
+            if self.db_conn is None or self.db_conn.closed != 0:
+                database_url = os.getenv("DATABASE_URL")
+                self.db_conn = psycopg2.connect(database_url, sslmode='require')
+                print("🔄 Reconnected to Neon database")
+        except Exception as e:
+            print(f"⚠️ Error reconnecting to database: {e}")
+            raise
+        return self.db_conn
+
 
     def get_user_email_from_clerk(self, clerk_id: str) -> Optional[str]:
         """Get user email from Clerk API"""
@@ -123,7 +136,8 @@ class VideoGenerationService:
 
     def get_or_create_internal_user(self, clerk_id: str):
         """Return the internal UUID corresponding to a Clerk ID."""
-        with self.db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
+        conn = self.get_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             # Check if user already exists
             cursor.execute("SELECT id FROM users WHERE clerk_id = %s", (clerk_id,))
             user = cursor.fetchone()
@@ -149,7 +163,8 @@ class VideoGenerationService:
                 print(f"User {clerk_user_id} has free access, skipping credit check")
                 return True
 
-            with self.db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            conn = self.get_connection()
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 # Get internal user ID
                 internal_user_id = self.get_or_create_internal_user(clerk_user_id)
                 
@@ -186,7 +201,8 @@ class VideoGenerationService:
                 print(f"User {clerk_user_id} has free access, skipping credit usage")
                 return True
 
-            with self.db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            conn = self.get_connection()
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 internal_user_id = self.get_or_create_internal_user(clerk_user_id)
                 
                 # Try to use subscription credit first
@@ -237,7 +253,8 @@ class VideoGenerationService:
 
     def create_video_record(self, clerk_user_id: str, title: str = "Untitled"):
         try:
-            with self.db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            conn = self.get_connection()
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 video_id = str(uuid.uuid4())
                 now = datetime.now()
 
@@ -273,7 +290,8 @@ class VideoGenerationService:
     
     def update_video_after_generation(self, video_id: str, preview_url: str, duration: int = None):
         try:
-            with self.db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            conn = self.get_connection()
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute("""
                     UPDATE videos 
                     SET mux_status = %s, 
@@ -296,7 +314,8 @@ class VideoGenerationService:
     def update_video_status(self, video_id: str, status: str, error_message: str = None):
         """Update video status in database"""
         try:
-            with self.db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            conn = self.get_connection()
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 # First check if error_message column exists
                 if error_message:
                     try:
