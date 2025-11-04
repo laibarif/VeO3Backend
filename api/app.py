@@ -27,7 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# List of emails that don't need payment checks - same as frontend
+# List of emails that don't need payment checks
 FREE_ACCESS_EMAILS = [
     "trajectri@gmail.com",
     "awaisnaeem962@gmail.com", 
@@ -42,75 +42,49 @@ class VideoCreateRequest(BaseModel):
     resolution: Optional[str] = "720p"
     negative_prompt: Optional[str] = None
 
-class DatabaseManager:
-    """Manages database connections with proper error handling and reconnection"""
-    
-    def __init__(self):
-        self._connection = None
-        self.database_url = os.getenv("DATABASE_URL")
-        
-    def get_connection(self):
-        """Get a fresh database connection"""
-        try:
-            if self._connection is not None:
-                self._connection.close()
-        except:
-            pass
-            
-        try:
-            self._connection = psycopg2.connect(self.database_url, sslmode='require')
-            print("✅ New database connection established")
-            return self._connection
-        except Exception as e:
-            print(f"❌ Failed to establish database connection: {e}")
-            raise
-    
-    @contextlib.contextmanager
-    def get_cursor(self):
-        """Context manager for database operations with automatic connection handling"""
-        conn = None
-        cursor = None
-        try:
-            conn = self.get_connection()
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
-            yield cursor
-            conn.commit()
-        except Exception as e:
-            if conn:
-                conn.rollback()
-            print(f"❌ Database operation failed: {e}")
-            raise
-        finally:
-            if cursor:
-                cursor.close()
-            if conn:
-                conn.close()
+def get_db_connection():
+    """Create a fresh database connection"""
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise ValueError("DATABASE_URL not found")
+    return psycopg2.connect(database_url, sslmode='require')
+
+@contextlib.contextmanager
+def db_cursor():
+    """Context manager for database operations"""
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        yield cursor
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"❌ Database operation failed: {e}")
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 class VideoGenerationService:
     def __init__(self):
         self.client = None
-        self.db_manager = DatabaseManager()
         self.init_services()
     
     def init_services(self):
         load_dotenv()
         
-        # Google AI client - using the new genai client
+        # Google AI client
         api_key = os.getenv("VEO3_API_KEY")
         if not api_key:
             raise ValueError("VEO3_API_KEY not found")
         
         self.client = genai.Client(api_key=api_key)
         print("Google AI Veo client initialized successfully")
-        
-        # Test database connection
-        try:
-            with self.db_manager.get_cursor() as cursor:
-                cursor.execute("SELECT 1")
-            print("Neon database connection established successfully")
-        except Exception as e:
-            print(f"Failed to establish database connection: {e}")
-            raise
 
     def get_user_email_from_clerk(self, clerk_id: str) -> Optional[str]:
         """Get user email from Clerk API"""
@@ -122,7 +96,6 @@ class VideoGenerationService:
                 print("CLERK_SECRET_KEY not found in environment")
                 return None
             
-            # Call Clerk API to get user details
             headers = {
                 "Authorization": f"Bearer {clerk_secret_key}",
                 "Content-Type": "application/json"
@@ -135,7 +108,6 @@ class VideoGenerationService:
             
             if response.status_code == 200:
                 user_data = response.json()
-                # Get primary email address
                 email_addresses = user_data.get('email_addresses', [])
                 primary_email = next(
                     (email for email in email_addresses if email.get('id') == user_data.get('primary_email_address_id')),
@@ -169,7 +141,7 @@ class VideoGenerationService:
 
     def get_or_create_internal_user(self, clerk_id: str):
         """Return the internal UUID corresponding to a Clerk ID."""
-        with self.db_manager.get_cursor() as cursor:
+        with db_cursor() as cursor:
             # Check if user already exists
             cursor.execute("SELECT id FROM users WHERE clerk_id = %s", (clerk_id,))
             user = cursor.fetchone()
@@ -183,20 +155,19 @@ class VideoGenerationService:
                 INSERT INTO users (id, clerk_id, name, image_url, video_credits)
                 VALUES (%s, %s, %s, %s, %s)
                 RETURNING id
-            """, (new_user_id, clerk_id, "Unknown Name", "", 3))  # 3 free credits
+            """, (new_user_id, clerk_id, "Unknown Name", "", 3))
             result = cursor.fetchone()
             return result['id']
 
     def check_user_credits(self, clerk_user_id: str) -> bool:
-        """Check if user has video credits available - skip for free access emails"""
+        """Check if user has video credits available"""
         try:
             # Check free access first
             if self.has_free_access(clerk_user_id):
                 print(f"User {clerk_user_id} has free access, skipping credit check")
                 return True
 
-            with self.db_manager.get_cursor() as cursor:
-                # Get internal user ID
+            with db_cursor() as cursor:
                 internal_user_id = self.get_or_create_internal_user(clerk_user_id)
                 
                 # Check subscription credits
@@ -225,14 +196,14 @@ class VideoGenerationService:
             return False
 
     def use_video_credit(self, clerk_user_id: str, video_id: str) -> bool:
-        """Use one video credit for the user - skip for free access emails"""
+        """Use one video credit for the user"""
         try:
             # Skip credit usage for free access users
             if self.has_free_access(clerk_user_id):
                 print(f"User {clerk_user_id} has free access, skipping credit usage")
                 return True
 
-            with self.db_manager.get_cursor() as cursor:
+            with db_cursor() as cursor:
                 internal_user_id = self.get_or_create_internal_user(clerk_user_id)
                 
                 # Try to use subscription credit first
@@ -247,7 +218,6 @@ class VideoGenerationService:
                 subscription_updated = cursor.fetchone()
                 
                 if subscription_updated:
-                    # Record credit usage
                     cursor.execute("""
                         INSERT INTO video_credits_usage (user_id, video_id, credits_used)
                         VALUES (%s, %s, 1)
@@ -280,12 +250,13 @@ class VideoGenerationService:
 
     def create_video_record(self, clerk_user_id: str, title: str = "Untitled"):
         """Create a new video record in the database"""
-        with self.db_manager.get_cursor() as cursor:
+        # Get internal user ID first (this uses its own connection)
+        internal_user_id = self.get_or_create_internal_user(clerk_user_id)
+        
+        # Then create video record with a separate connection
+        with db_cursor() as cursor:
             video_id = str(uuid.uuid4())
             now = datetime.now()
-
-            # Get internal UUID for the Clerk user
-            internal_user_id = self.get_or_create_internal_user(clerk_user_id)
 
             cursor.execute("""
                 INSERT INTO videos (
@@ -311,7 +282,7 @@ class VideoGenerationService:
     
     def update_video_after_generation(self, video_id: str, preview_url: str, duration: int = None):
         """Update video record after successful generation"""
-        with self.db_manager.get_cursor() as cursor:
+        with db_cursor() as cursor:
             cursor.execute("""
                 UPDATE videos 
                 SET mux_status = %s, 
@@ -328,8 +299,7 @@ class VideoGenerationService:
 
     def update_video_status(self, video_id: str, status: str, error_message: str = None):
         """Update video status in database"""
-        with self.db_manager.get_cursor() as cursor:
-            # First check if error_message column exists
+        with db_cursor() as cursor:
             if error_message:
                 try:
                     cursor.execute("""
@@ -340,7 +310,6 @@ class VideoGenerationService:
                         WHERE id = %s
                     """, (status, datetime.now(), error_message, video_id))
                 except psycopg2.Error:
-                    # If error_message column doesn't exist, update without it
                     cursor.execute("""
                         UPDATE videos 
                         SET mux_status = %s, 
@@ -416,27 +385,27 @@ video_service = VideoGenerationService()
 
 @app.post("/api/videos/create")
 async def create_video(request: VideoCreateRequest, background_tasks: BackgroundTasks):
-    """Endpoint to replace your TRPC create procedure"""
+    """Endpoint to create a new video"""
     try:
-        # Check if user has credits (skip for free access emails)
+        # Check if user has credits
         if not video_service.check_user_credits(request.user_id):
             raise HTTPException(
                 status_code=402, 
                 detail="Insufficient video credits. Please upgrade your subscription."
             )
         
-        # Step 1: Create video record in database
+        # Create video record in database
         video_record = video_service.create_video_record(request.user_id, request.title)
         video_id = video_record['id']
         
-        # Use one credit (skip for free access emails)
+        # Use one credit
         if not video_service.use_video_credit(request.user_id, video_id):
             raise HTTPException(
                 status_code=402, 
                 detail="Failed to use video credit. Please try again."
             )
         
-        # Step 2: Start background video generation
+        # Start background video generation
         background_tasks.add_task(
             generate_video_background,
             video_id,
@@ -468,20 +437,17 @@ async def generate_video_background(video_id: str, prompt: str, aspect_ratio: st
         # Update status to generating
         video_service.update_video_status(video_id, "generating")
         
-        # Generate video using the same approach as your working script
+        # Generate video
         operation = video_service.generate_video(prompt, aspect_ratio, resolution, negative_prompt)
         operation = video_service.poll_operation(operation)
         video_path = video_service.save_video_to_storage(operation)
         
-        # Estimate duration (you might want to extract this from the video file)
+        # Estimate duration
         duration = 8000  # 8 seconds default
         
         # Update video record with generation results
-        # Convert local path to a public URL for frontend
         preview_filename = os.path.basename(video_path)
-        
         preview_url = f"http://veo3backend-production.up.railway.app/generated_videos/{preview_filename}"
-        # preview_url = f"http://localhost:8000/generated_videos/{preview_filename}"
 
         video_service.update_video_after_generation(video_id, preview_url=preview_url, duration=duration)
 
@@ -489,14 +455,13 @@ async def generate_video_background(video_id: str, prompt: str, aspect_ratio: st
         
     except Exception as e:
         print(f"Video generation failed for {video_id}: {str(e)}")
-        # Update status to failed
         video_service.update_video_status(video_id, "failed", str(e))
 
 @app.get("/api/videos/{video_id}/status")
 async def get_video_status(video_id: str):
     """Check video generation status"""
     try:
-        with video_service.db_manager.get_cursor() as cursor:
+        with db_cursor() as cursor:
             cursor.execute("SELECT * FROM videos WHERE id = %s", (video_id,))
             video = cursor.fetchone()
             
