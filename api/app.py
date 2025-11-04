@@ -152,7 +152,7 @@ class VideoGenerationService:
                 VALUES (%s, %s, %s, %s, %s)
                 RETURNING id
             """, (new_user_id, clerk_id, "Unknown Name", "", 3))  # 3 free credits
-            self.db_conn.commit()
+            conn.commit()
             return new_user_id
 
     def check_user_credits(self, clerk_user_id: str) -> bool:
@@ -222,7 +222,7 @@ class VideoGenerationService:
                         INSERT INTO video_credits_usage (user_id, video_id, credits_used)
                         VALUES (%s, %s, 1)
                     """, (internal_user_id, video_id))
-                    self.db_conn.commit()
+                    conn.commit()
                     return True
                 
                 # Try to use free credit
@@ -241,13 +241,14 @@ class VideoGenerationService:
                         INSERT INTO video_credits_usage (user_id, video_id, credits_used)
                         VALUES (%s, %s, 1)
                     """, (internal_user_id, video_id))
-                    self.db_conn.commit()
+                    conn.commit()
                     return True
                 
                 return False
                 
         except Exception as e:
-            self.db_conn.rollback()
+            conn = self.get_connection()
+c           onn.rollback()
             print(f"Error using video credit: {e}")
             return False
 
@@ -280,12 +281,13 @@ class VideoGenerationService:
                 ))
 
                 video_record = cursor.fetchone()
-                self.db_conn.commit()
+                conn.commit()
                 print(f"Stored video for Clerk user: {clerk_user_id}")
                 return video_record
 
         except Exception as e:
-            self.db_conn.rollback()
+            conn = self.get_connection()
+            conn.rollback()
             raise e
     
     def update_video_after_generation(self, video_id: str, preview_url: str, duration: int = None):
@@ -304,11 +306,12 @@ class VideoGenerationService:
                 """, ('ready', duration, datetime.now(), 'public', preview_url, video_id))
             
                 updated_video = cursor.fetchone()
-                self.db_conn.commit()
+                conn.commit()
                 return updated_video
             
         except Exception as e:
-            self.db_conn.rollback()
+            conn = self.get_connection()
+            conn.rollback()
             raise e
 
     def update_video_status(self, video_id: str, status: str, error_message: str = None):
@@ -342,10 +345,11 @@ class VideoGenerationService:
                         WHERE id = %s
                     """, (status, datetime.now(), video_id))
                 
-                self.db_conn.commit()
+                conn.commit()
                 
         except Exception as e:
-            self.db_conn.rollback()
+            conn = self.get_connection()
+            conn.rollback()
             raise e
 
     def generate_video(self, prompt: str, aspect_ratio: str = "16:9", resolution: str = "720p", negative_prompt: str = None):
